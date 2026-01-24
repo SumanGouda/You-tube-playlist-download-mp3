@@ -1,3 +1,21 @@
-__pycache__/
-env/
+# Ignore the downloads folder (audio files and ZIP)
 downloads/
+playlist.zip
+
+# Python system files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+.venv/
+venv/
+env/
+
+# Jupyter Notebook files
+.ipynb_checkpoints/
+scraper.ipynb
+
+# System/IDE files
+.vscode/
+.DS_Store
