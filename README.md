@@ -42,5 +42,5 @@ Before running the notebook, ensure you have the following installed:
    cd You-tube-playlist-download-mp3
 
 2. **Install Requirements**
-    ``bash
+    ```bash
     pip install requirements.txt
