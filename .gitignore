@@ -19,3 +19,4 @@ scraper.ipynb
 # System/IDE files
 .vscode/
 .DS_Store
+Dockerfile
