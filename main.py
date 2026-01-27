@@ -1,53 +1,58 @@
 import streamlit as st
 import requests
 import time
+import threading
+import uvicorn
+from app import app  # Import your FastAPI app object
 
-st.set_page_config(page_title="YT MP3 Downloader", layout="centered")
-st.title("🎵 YouTube Playlist Downloader")
+def run_backend():
+    # Runs the FastAPI server on a background thread
+    uvicorn.run(app, host="0.0.0.0", port=8000)
 
-BACKEND_URL = "http://127.0.0.1:8000"
+# Start the thread only once
+if "backend_started" not in st.session_state:
+    thread = threading.Thread(target=run_backend, daemon=True)
+    thread.start()
+    st.session_state["backend_started"] = True
 
-url = st.text_input("YouTube Playlist URL")
-quality = st.selectbox("Select MP3 Quality (kbps)", ["320", "256", "192", "128"])
+st.set_page_config(page_title="YouTube Downloader", layout="wide")
+st.title("YouTube Playlist Downloader 📥")
 
-if st.button("🚀 Start Download"):
-    if url:
-        try:
-            payload = {"url": str(url), "quality": str(quality)}
-            requests.post(f"{BACKEND_URL}/start-download", json=payload)
-            
-            # Use a spinner instead of a progress bar
-            with st.spinner("Processing your request..."):
-                status_text = st.empty()
-                
-                while True:
-                    res = requests.get(f"{BACKEND_URL}/progress").json()
-                    status = res["status"]
-                    p = res["percentage"]
-                    
-                    # Update status text so user sees which song is downloading
-                    status_text.text(f"Current Status: {status} ({p}%)")
-                    
-                    if status == "ready":
-                        break
-                    
-                    if "error" in status:
-                        st.error(f"Error: {status}")
-                        st.stop() # Stop execution if error occurs
-                        
-                    time.sleep(2)
-            
-            # Once the spinner finishes (status == "ready")
-            st.success("✅ All songs processed and zipped!")
-            zip_data = requests.get(f"{BACKEND_URL}/get-zip").content
-            st.download_button(
-                label="💾 Download ZIP Archive",
-                data=zip_data,
-                file_name="youtube_playlist.zip",
-                mime="application/zip"
-            )
-            
-        except Exception as e:
-            st.error(f"Could not connect to backend: {e}")
+url = st.text_input("Enter YouTube URL (Video or Playlist):")
+col1, col2 = st.columns(2)
+
+with col1:
+    download_type = st.radio("Select Format:", ("MP3 (Audio)", "MP4 (Video)"))
+
+with col2:
+    if "MP3" in download_type:
+        quality = st.selectbox("Select Audio Bitrate (kbps):", ("192", "128", "320"))
     else:
-        st.error("Please enter a URL")
+        quality = st.selectbox("Select Max Resolution:", ("720p", "1080p", "480p", "360p"))
+
+if st.button("Start Download"):
+    if url:
+        fmt = "mp3" if "MP3" in download_type else "mp4"
+        payload = {"url": url, "quality": quality, "file_format": fmt}
+        
+        requests.post("http://localhost:8000/start-download", json=payload)
+        
+        bar = st.progress(0)
+        status_display = st.empty()
+        
+        while True:
+            prog = requests.get("http://localhost:8000/progress").json()
+            bar.progress(prog["percentage"] / 100)
+            status_display.info(f"✨ {prog['status']}")
+            
+            if prog["status"] == "ready":
+                st.success("Download Complete! Your file is ready.")
+                with open("playlist.zip", "rb") as f:
+                    st.download_button("💾 Download ZIP", f, file_name="youtube_playlist.zip")
+                break
+            elif "error" in prog["status"]:
+                st.error(prog["status"])
+                break
+            time.sleep(0.5)
+    else:
+        st.warning("Please enter a valid YouTube URL.")

@@ -6,6 +6,7 @@ import os
 import shutil
 import zipfile
 import re
+import gc
 
 app = FastAPI()
 
@@ -20,9 +21,11 @@ INITIAL_STATE = {
 
 progress_db = INITIAL_STATE.copy()
 
+
 class DownloadRequest(BaseModel):
     url: str
     quality: str
+    file_format: str 
 
 def clean_percent(p_str):
     clean = re.sub(r'\x1b\[[0-9;]*m', '', p_str)
@@ -30,86 +33,102 @@ def clean_percent(p_str):
 
 def progress_hook(d):
     if d['status'] == 'downloading':
-        p_str = d.get('_percent_str', '0%')
-        try:
-            song_p = float(clean_percent(p_str))
-            
-            # Weighted Math
-            completed_weight = (progress_db["current_item"] - 1) * 100
-            total_weighted_p = (completed_weight + song_p) / progress_db["total_items"]
-            
-            # Crucial: Never let the percentage go backward
-            new_p = round(total_weighted_p, 2)
-            if new_p > progress_db["percentage"]:
-                progress_db["percentage"] = new_p
-                
-            progress_db["status"] = f"Downloading song {progress_db['current_item']} of {progress_db['total_items']}"
-        except:
-            pass
+        progress_db["status"] = (
+            f"Downloading {progress_db['current_item']} / "
+            f"{progress_db['total_items']}"
+        )
 
-def download_logic(url, quality):
+def download_logic(url, quality, file_format):
     try:
         download_path = "downloads"
         zip_name = "playlist.zip"
 
-        if os.path.exists(download_path):
-            shutil.rmtree(download_path)
-        if os.path.exists(zip_name):
-            os.remove(zip_name)
+        # Cleanup existing files to save disk space
+        if os.path.exists(download_path): shutil.rmtree(download_path)
+        if os.path.exists(zip_name): os.remove(zip_name)
         os.makedirs(download_path)
 
-        with yt_dlp.YoutubeDL({'quiet': True, 'extract_flat': True}) as ydl:
+        # 1. Analyze playlist
+        with yt_dlp.YoutubeDL({'quiet': True, 'extract_flat': True, 'ignoreerrors': True}) as ydl:
             info = ydl.extract_info(url, download=False)
-            entries = info.get('entries', [info])
+            if not info:
+                raise Exception("Could not retrieve playlist info.")
+            
+            entries = [e for e in info.get('entries', []) if e is not None]
+            if not entries: 
+                entries = [info]
+            
             progress_db["total_items"] = len(entries)
 
+        # 2. Configure ydl_opts with Memory Protections
         ydl_opts = {
-            'format': 'bestaudio/best',
             'outtmpl': f'{download_path}/%(title)s.%(ext)s',
             'progress_hooks': [progress_hook],
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': quality,
-            }],
+            'ignoreerrors': True,
+            'buffersize': 1024 * 16, # Small buffer forces data to Disk, saving RAM
+            'noprogress': True,      # Reduces CPU usage for logging
         }
 
+        if file_format == "mp3":
+            ydl_opts.update({
+                'format': 'bestaudio/best',
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': quality,
+                }],
+            })
+        else:
+            # Your modified height logic
+            height = int(quality.replace("p", ""))
+            ydl_opts.update({
+                'format': f'bestvideo[ext=mp4][height<={height}]+bestaudio[ext=m4a]/best[ext=mp4][height<={height}]/best',
+                'merge_output_format': 'mp4',
+                'skip_unavailable_fragments': True,
+                'cookiefile': 'cookies.txt' # Ensure this file exists in your directory
+            })
+
+        # 3. Download loop with RAM clearing
         for i, entry in enumerate(entries, 1):
             progress_db["current_item"] = i
-            # Force the status text to update so the user knows a new song started
-            progress_db["status"] = f"Starting song {i} of {len(entries)}..."
+            progress_db["status"] = f"Downloading video {i} out of {progress_db['total_items']}..."
             
             video_url = entry.get('url') or entry.get('webpage_url') or f"https://www.youtube.com/watch?v={entry['id']}"
+            
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([video_url])
+            
+            # CRUCIAL: Manually clear RAM after every video
+            gc.collect()
 
-        progress_db["status"] = "Zipping files..."
-        with zipfile.ZipFile(zip_name, "w") as zipf:
-            for root, dirs, files in os.walk(download_path):
+        # 4. Finalizing
+        progress_db["status"] = "Finalizing: Zipping files..."
+        # Using ZIP_DEFLATED ensures compression happens on disk
+        with zipfile.ZipFile(zip_name, "w", compression=zipfile.ZIP_DEFLATED) as zipf:
+            for root, _, files in os.walk(download_path):
                 for file in files:
-                    if file.endswith(".mp3"):
+                    if file.endswith((".mp3", ".mp4")):
                         zipf.write(os.path.join(root, file), file)
         
-        shutil.rmtree(download_path) # Delete the folder of individual MP3s
+        # Cleanup folder immediately after zipping
+        shutil.rmtree(download_path)
         
         progress_db["percentage"] = 100
         progress_db["status"] = "ready"
         progress_db["is_downloading"] = False
+
     except Exception as e:
         progress_db["status"] = f"error: {str(e)}"
         progress_db["is_downloading"] = False
 
 @app.post("/start-download")
 async def start_download(request: DownloadRequest, background_tasks: BackgroundTasks):
-    # Reset State Completely
     progress_db.update({
-        "percentage": 0,
-        "current_item": 0,
-        "total_items": 1,
-        "status": "Analyzing playlist...",
-        "is_downloading": True
+        "percentage": 0, "current_item": 0, "total_items": 1,
+        "status": "Analyzing playlist...", "is_downloading": True
     })
-    background_tasks.add_task(download_logic, request.url, request.quality)
+    # Pass the format to the logic
+    background_tasks.add_task(download_logic, request.url, request.quality, request.file_format)
     return {"message": "Started"}
 
 @app.get("/progress")
