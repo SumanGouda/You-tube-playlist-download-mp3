@@ -1,6 +1,7 @@
 # Ignore the downloads folder (audio files and ZIP)
 downloads/
 playlist.zip
+gitignore/
 
 # Python system files
 __pycache__/

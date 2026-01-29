@@ -7,8 +7,17 @@ import shutil
 import zipfile
 import re
 import gc
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Initial State
 INITIAL_STATE = {
@@ -21,21 +30,16 @@ INITIAL_STATE = {
 
 progress_db = INITIAL_STATE.copy()
 
-
 class DownloadRequest(BaseModel):
     url: str
     quality: str
     file_format: str 
 
-def clean_percent(p_str):
-    clean = re.sub(r'\x1b\[[0-9;]*m', '', p_str)
-    return clean.replace('%', '').strip()
-
 def progress_hook(d):
     if d['status'] == 'downloading':
+        # This keeps the text updated in the UI
         progress_db["status"] = (
-            f"Downloading {progress_db['current_item']} / "
-            f"{progress_db['total_items']}"
+            f"Downloading {progress_db['current_item']} of {progress_db['total_items']}"
         )
 
 def download_logic(url, quality, file_format):
@@ -43,30 +47,22 @@ def download_logic(url, quality, file_format):
         download_path = "downloads"
         zip_name = "playlist.zip"
 
-        # Cleanup existing files to save disk space
+        # 1. CLEANUP
         if os.path.exists(download_path): shutil.rmtree(download_path)
         if os.path.exists(zip_name): os.remove(zip_name)
         os.makedirs(download_path)
 
-        # 1. Analyze playlist
-        with yt_dlp.YoutubeDL({'quiet': True, 'extract_flat': True, 'ignoreerrors': True}) as ydl:
+        # 2. ANALYZE
+        with yt_dlp.YoutubeDL({'quiet': True, 'extract_flat': True}) as ydl:
             info = ydl.extract_info(url, download=False)
-            if not info:
-                raise Exception("Could not retrieve playlist info.")
-            
-            entries = [e for e in info.get('entries', []) if e is not None]
-            if not entries: 
-                entries = [info]
-            
+            entries = info.get('entries', [info])
             progress_db["total_items"] = len(entries)
 
-        # 2. Configure ydl_opts with Memory Protections
+        # 3. OPTIONS
         ydl_opts = {
             'outtmpl': f'{download_path}/%(title)s.%(ext)s',
             'progress_hooks': [progress_hook],
             'ignoreerrors': True,
-            'buffersize': 1024 * 16, # Small buffer forces data to Disk, saving RAM
-            'noprogress': True,      # Reduces CPU usage for logging
         }
 
         if file_format == "mp3":
@@ -79,38 +75,33 @@ def download_logic(url, quality, file_format):
                 }],
             })
         else:
-            # Your modified height logic
-            height = int(quality.replace("p", ""))
+            height = quality.replace("p", "")
             ydl_opts.update({
-                'format': f'bestvideo[ext=mp4][height<={height}]+bestaudio[ext=m4a]/best[ext=mp4][height<={height}]/best',
+                'format': f'bestvideo[height<={height}]+bestaudio/best',
                 'merge_output_format': 'mp4',
-                'skip_unavailable_fragments': True,
-                'cookiefile': 'cookies.txt' # Ensure this file exists in your directory
             })
 
-        # 3. Download loop with RAM clearing
+        # 4. DOWNLOAD LOOP
         for i, entry in enumerate(entries, 1):
             progress_db["current_item"] = i
-            progress_db["status"] = f"Downloading video {i} out of {progress_db['total_items']}..."
             
-            video_url = entry.get('url') or entry.get('webpage_url') or f"https://www.youtube.com/watch?v={entry['id']}"
+            # This line FIXES the progress bar visibility
+            progress_db["percentage"] = int((i / progress_db["total_items"]) * 95)
+            
+            video_url = entry.get('url') or entry.get('webpage_url') or f"https://www.youtube.com/watch?v={entry.get('id')}"
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([video_url])
             
-            # CRUCIAL: Manually clear RAM after every video
             gc.collect()
 
-        # 4. Finalizing
-        progress_db["status"] = "Finalizing: Zipping files..."
-        # Using ZIP_DEFLATED ensures compression happens on disk
-        with zipfile.ZipFile(zip_name, "w", compression=zipfile.ZIP_DEFLATED) as zipf:
+        # 5. ZIP
+        progress_db["status"] = "Creating ZIP..."
+        with zipfile.ZipFile(zip_name, "w") as zipf:
             for root, _, files in os.walk(download_path):
                 for file in files:
-                    if file.endswith((".mp3", ".mp4")):
-                        zipf.write(os.path.join(root, file), file)
+                    zipf.write(os.path.join(root, file), file)
         
-        # Cleanup folder immediately after zipping
         shutil.rmtree(download_path)
         
         progress_db["percentage"] = 100
@@ -118,16 +109,16 @@ def download_logic(url, quality, file_format):
         progress_db["is_downloading"] = False
 
     except Exception as e:
+        print(f"Error: {e}")
         progress_db["status"] = f"error: {str(e)}"
         progress_db["is_downloading"] = False
 
 @app.post("/start-download")
 async def start_download(request: DownloadRequest, background_tasks: BackgroundTasks):
     progress_db.update({
-        "percentage": 0, "current_item": 0, "total_items": 1,
-        "status": "Analyzing playlist...", "is_downloading": True
+        "percentage": 0, "current_item": 0, 
+        "total_items": 1, "status": "Initializing...", "is_downloading": True
     })
-    # Pass the format to the logic
     background_tasks.add_task(download_logic, request.url, request.quality, request.file_format)
     return {"message": "Started"}
 
