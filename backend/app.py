@@ -5,9 +5,12 @@ import yt_dlp
 import os
 import shutil
 import zipfile
-import re
 import gc
 from fastapi.middleware.cors import CORSMiddleware
+import static_ffmpeg
+
+# Initialize FFmpeg
+static_ffmpeg.add_paths()
 
 app = FastAPI()
 
@@ -19,16 +22,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initial State
-INITIAL_STATE = {
+# Vercel requires writing to /tmp
+TMP_DOWNLOAD_PATH = "/tmp/downloads"
+TMP_ZIP_NAME = "/tmp/playlist.zip"
+
+progress_db = {
     "percentage": 0, 
     "status": "idle",
     "current_item": 0,
     "total_items": 1,
     "is_downloading": False
 }
-
-progress_db = INITIAL_STATE.copy()
 
 class DownloadRequest(BaseModel):
     url: str
@@ -37,20 +41,16 @@ class DownloadRequest(BaseModel):
 
 def progress_hook(d):
     if d['status'] == 'downloading':
-        # This keeps the text updated in the UI
         progress_db["status"] = (
             f"Downloading {progress_db['current_item']} of {progress_db['total_items']}"
         )
 
 def download_logic(url, quality, file_format):
     try:
-        download_path = "downloads"
-        zip_name = "playlist.zip"
-
-        # 1. CLEANUP
-        if os.path.exists(download_path): shutil.rmtree(download_path)
-        if os.path.exists(zip_name): os.remove(zip_name)
-        os.makedirs(download_path)
+        # 1. CLEANUP (Using /tmp paths)
+        if os.path.exists(TMP_DOWNLOAD_PATH): shutil.rmtree(TMP_DOWNLOAD_PATH)
+        if os.path.exists(TMP_ZIP_NAME): os.remove(TMP_ZIP_NAME)
+        os.makedirs(TMP_DOWNLOAD_PATH, exist_ok=True)
 
         # 2. ANALYZE
         with yt_dlp.YoutubeDL({'quiet': True, 'extract_flat': True}) as ydl:
@@ -60,9 +60,10 @@ def download_logic(url, quality, file_format):
 
         # 3. OPTIONS
         ydl_opts = {
-            'outtmpl': f'{download_path}/%(title)s.%(ext)s',
+            'outtmpl': f'{TMP_DOWNLOAD_PATH}/%(title)s.%(ext)s',
             'progress_hooks': [progress_hook],
             'ignoreerrors': True,
+            'nocheckcertificate': True, # Useful for server environments
         }
 
         if file_format == "mp3":
@@ -84,8 +85,6 @@ def download_logic(url, quality, file_format):
         # 4. DOWNLOAD LOOP
         for i, entry in enumerate(entries, 1):
             progress_db["current_item"] = i
-            
-            # This line FIXES the progress bar visibility
             progress_db["percentage"] = int((i / progress_db["total_items"]) * 95)
             
             video_url = entry.get('url') or entry.get('webpage_url') or f"https://www.youtube.com/watch?v={entry.get('id')}"
@@ -97,19 +96,19 @@ def download_logic(url, quality, file_format):
 
         # 5. ZIP
         progress_db["status"] = "Creating ZIP..."
-        with zipfile.ZipFile(zip_name, "w") as zipf:
-            for root, _, files in os.walk(download_path):
+        with zipfile.ZipFile(TMP_ZIP_NAME, "w") as zipf:
+            for root, _, files in os.walk(TMP_DOWNLOAD_PATH):
                 for file in files:
                     zipf.write(os.path.join(root, file), file)
         
-        shutil.rmtree(download_path)
+        if os.path.exists(TMP_DOWNLOAD_PATH):
+            shutil.rmtree(TMP_DOWNLOAD_PATH)
         
         progress_db["percentage"] = 100
         progress_db["status"] = "ready"
         progress_db["is_downloading"] = False
 
     except Exception as e:
-        print(f"Error: {e}")
         progress_db["status"] = f"error: {str(e)}"
         progress_db["is_downloading"] = False
 
@@ -128,4 +127,6 @@ async def get_progress():
 
 @app.get("/get-zip")
 async def get_zip():
-    return FileResponse("playlist.zip", media_type="application/zip", filename="playlist.zip")
+    if os.path.exists(TMP_ZIP_NAME):
+        return FileResponse(TMP_ZIP_NAME, media_type="application/zip", filename="playlist.zip")
+    raise HTTPException(status_code=404, detail="File not found")
